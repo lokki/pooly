@@ -7,109 +7,40 @@ defmodule Pooly.Server do
 
   ## Client API
 
-  def start_link(sup, pool_config) do
-    GenServer.start_link(__MODULE__, [sup, pool_config], name: __MODULE__)
+  def start_link(pools_config) do
+    GenServer.start_link(__MODULE__, pools_config, name: __MODULE__)
   end
 
-  def checkout do
-    GenServer.call(__MODULE__, :checkout)
+  def checkout(pool_name) do
+    GenServer.call(:"#{pool_name}Server", :checkout)
   end
 
-  def checkin(worker_pid) do
-    GenServer.cast(__MODULE__, {:checkin, worker_pid})
+  def checkin(pool_name, worker_pid) do
+    GenServer.cast(:"#{pool_name}Server", {:checkin, worker_pid})
   end
 
-  def status do
-    GenServer.call(__MODULE__, :status)
+  def status(pool_name) do
+    GenServer.call(:"#{pool_name}Server", :status)
   end
 
   ## Callbacks
 
-  def init([pid, pool_config]) when is_pid(pid) do
-    Process.flag(:trap_exits, true)
-    monitors = :ets.new(:monitors, [:set, :private])
-    init(pool_config, %State{sup: pid, monitors: monitors})
+  def init(pools_config) do
+    pools_config |> Enum.each(fn pc -> send(self, {:start_pool, pc}) end)
+    {:ok, pools_config}
   end
 
-  def handle_info(:start_worker_supervisor, %State{sup: sup, mfa: mfa, size: size} = state) do
-    {:ok, worker_sup} = Supervisor.start_child(sup, supervisor_spec(mfa))
-    workers = prepopulate(size, worker_sup)
-    {:noreply, %State{state | worker_sup: worker_sup, workers: workers}}
-  end
-
-  def handle_info({:DOWN, ref, _, _, _}, %State{workers: workers, monitors: monitors} = state) do
-    case :ets.match(monitors, {:"$1", ref}) do
-      [[pid]] ->
-        true = :ets.delete(monitors, pid)
-        new_state = %State{state | workers: [pid | workers]}
-        {:noreply, new_state}
-      [[]] ->
-        {:noreply, state}
-    end
-  end
-
-  def handle_info({:EXIT, pid, _reason}, %State{workers: workers, monitors: monitors, worker_sup: worker_sup} = state) do
-    case :ets.lookup(monitors, pid) do
-      [{^pid, ref}] ->
-        true = Process.demonitor(ref)
-        true = :ets.delete(monitors, pid)
-        new_state = %State{state | workers: [new_worker(worker_sup) | workers]}
-        {:noreply, new_state}
-      _ ->
-        {:noreply, state}
-    end
-  end
-
-  def handle_call(:checkout, {from_pid, _ref}, %State{workers: workers, monitors: monitors} = state) do
-    case workers do
-      [worker | rest] ->
-        ref = Process.monitor(from_pid)
-        true = :ets.insert(monitors, {worker, ref})
-        {:reply, worker, %State{state | workers: rest}}
-      [] -> 
-        {:reply, :noproc, state}
-    end
-  end
-
-  def handle_call(:status, _from, %State{workers: workers, monitors: monitors} = state) do
-    {:reply, {length(workers), :ets.info(monitors, :size)}, state}
-  end
-
-  def handle_cast({:checkin, worker}, %State{workers: workers, monitors: monitors} = state) when is_pid(worker) do
-    case :ets.lookup(monitors, worker) do
-      [{^worker, ref}] ->
-        true = Process.demonitor(ref)
-        true = :ets.delete(monitors, worker)
-        {:noreply, %State{state | workers: [worker | workers]}}
-      _ -> 
-        {:noreply, state}
-    end
+  def handle_info({:start_pool, pool_config}, state) do
+    {:ok, _pool_sup} = Supervisor.start_child(Pooly.PoolsSupervisor, supervisor_spec(pool_config))
+    {:noreply, state}
   end
 
   ## Helpers
 
-  ## Validate and parse configuration
-  defp init([{:mfa, mfa} | rest], state), do: init(rest, %State{state | mfa: mfa})
-  defp init([{:size, size} | rest], state), do: init(rest, %State{state | size: size})
-  defp init([_ | rest], state), do: init(rest, state)
-  defp init([], state) do
-    send(self, :start_worker_supervisor)
-    {:ok, state}
-  end
-
-  defp supervisor_spec(mfa) do
+  defp supervisor_spec(pool_config) do
     import Supervisor.Spec
 
-    opts = [restart: :temporary]
-    supervisor(Pooly.WorkerSupervisor, [mfa], opts)
-  end
-
-  defp prepopulate(size, sup), do: prepopulate(size, sup, [])
-  defp prepopulate(size, _sup, workers) when size < 1, do: workers
-  defp prepopulate(size, sup, workers), do: prepopulate(size - 1, sup, [new_worker(sup) | workers])
-
-  defp new_worker(sup) do
-    {:ok, worker_pid} = Supervisor.start_child(sup, [[]])
-    worker_pid
+    opts = [id: :"#{pool_config[:name]}Supervisor"]
+    supervisor(Pooly.PoolSupervisor, [pool_config], opts)
   end
 end
